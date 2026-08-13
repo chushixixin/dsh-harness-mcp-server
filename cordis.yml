@@ -1,7 +1,7 @@
 # --patch 加载插件(patch 格式): 在 Harness 内部启动 MCP server(8090), 暴露能力给 Hermes
 - insert:
     - id: harness-mcp-server
-      name: '@deepseek-ai/dsh-harness-mcp-server'
+      name: '@chushixixin/dsh-harness-mcp-server'
       config:
         http: true
         port: 8090

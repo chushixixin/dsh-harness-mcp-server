@@ -1,12 +1,15 @@
 # dsh-harness-mcp-server
 
-> Expose [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) agent capabilities as an **MCP server**, so an external MCP client (e.g. [Hermes](https://hermes-agent.nousresearch.com/)) can drive Harness to execute real coding tasks.
+> Expose [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) agent capabilities as an **MCP server**, letting any MCP client (e.g. [Hermes](https://hermes-agent.nousresearch.com/)) drive Harness to execute real coding tasks.
 
-**Hermes = brain (pro), Harness = arms (flash). 1+1>2.**
+**Hermes is the brain (pro), Harness is the arms (flash) — 1+1>2.**
 
-## What it does
+[![npm version](https://img.shields.io/npm/v/@chushixixin/dsh-harness-mcp-server)](https://www.npmjs.com/package/@chushixixin/dsh-harness-mcp-server)
+[![license](https://img.shields.io/npm/l/@chushixixin/dsh-harness-mcp-server)](./LICENSE)
 
-This is a [Cordis plugin](https://github.com/deepseek-ai/deepseek-harness) that runs **inside** Harness and starts a real MCP server (StreamableHTTP) on port `8090`. Through `ctx`, it bridges Harness's core services — `ctx.agents`, `ctx.agentPresets`, `ctx.tools` — and exposes them to any MCP client.
+## Why this exists
+
+Harness ships a powerful agent runtime (tools, LLM, agents, sessions), but it is a **Cordis app**, not something another agent can call. This plugin turns Harness inside-out: it starts a real **MCP server** (StreamableHTTP) *inside* Harness and bridges Harness's core services — `ctx.agents`, `ctx.agentPresets`, `ctx.tools` — so an external "brain" can delegate real work to Harness's "arms".
 
 ```
 Hermes (MCP client, brain)
@@ -24,8 +27,8 @@ Harness agent (flash) — full toolset: bash, fs, todo, web…
 |------|-----------|---------|
 | `echo` | — | Verify MCP connectivity |
 | `harness_list_tools` | — | List Harness's registered tool names |
-| `agent_run` | Hermes → Harness | Run a task synchronously, return structured result |
-| `task_inbox` | Hermes → Harness | Push a structured task (`task + memory context + cwd`) to an async queue |
+| `agent_run` | Hermes → Harness | Run a task synchronously and return a structured result |
+| `task_inbox` | Hermes → Harness | Push a structured task (task + memory context + cwd) to an async queue |
 | `task_result` | Hermes ← Harness | Poll a queued task's structured result |
 
 Every task result is **structured**:
@@ -42,9 +45,19 @@ Every task result is **structured**:
 }
 ```
 
-This closes the loop between the client's persistent memory and Harness's coding: memory is fed into the task as `context`, and the result (changes/verification/leftovers) can be persisted back to the client's memory for the next run.
+This closes the loop between the client's persistent memory and Harness's coding: memory is fed into each task as `context`, and the result (`changes` / `verification` / `leftovers`) can be persisted back to the client's memory for the next run.
 
 ## Install
+
+### Option A — from npm (recommended)
+
+```bash
+npm install @chushixixin/dsh-harness-mcp-server
+```
+
+Then reference the plugin from your Harness workspace (see the cordis patch below).
+
+### Option B — from source
 
 Clone this repo inside your Harness workspace under `packages/mcp/harness-mcp-server/` (the pnpm workspace matches `packages/*/*`, two levels deep):
 
@@ -82,17 +95,17 @@ printf 'n\nY\n' | hermes mcp add harness_plugin --url http://127.0.0.1:8090/mcp
 ```yaml
 - insert:
     - id: harness-mcp-server
-      name: '@deepseek-ai/dsh-harness-mcp-server'
+      name: '@chushixixin/dsh-harness-mcp-server'
       config: { http: true, port: 8090, host: 0.0.0.0 }
 ```
 
-## Notes / positioning
+## Positioning
 
-This is best used as a **fallback tool**, not a daily driver: for everyday code edits, drive your primary agent directly. Reach for this when you need context isolation (huge refactors that would blow the client's context) or parallel execution of unrelated tasks.
+This is best used as a **fallback tool**, not a daily driver: for everyday code edits, drive your primary agent directly. Reach for this when you need **context isolation** (huge refactors that would blow the client's context) or **parallel execution** of unrelated tasks.
 
-- The agent session is **reused per cwd** (avoids re-loading project context every call — ~15-20x cheaper than one-shot `dsh headless`).
+- The agent session is **reused per cwd** (avoids re-loading project context on every call — roughly 15–20× cheaper than one-shot `dsh headless`).
 - Bash runs sandboxed (`workspace-write`): install `bubblewrap` on the host, or the sandbox will refuse write commands.
-- Each new MCP session gets its own `McpServer` + transport (MCP `McpServer` connects to a single transport).
+- Each new MCP session gets its own `McpServer` + transport (an MCP `McpServer` connects to a single transport).
 
 ## License
 
