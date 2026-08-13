@@ -32,6 +32,10 @@ export interface Config {
     taskTtlMs?: number;
     /** 常驻 agent 会话上限(默认 8, LRU 淘汰) */
     maxAgents?: number;
+    /** Bearer token 认证(设置后所有请求必须带 Authorization: Bearer <token>) */
+    authToken?: string;
+    /** cwd 白名单(设置后 agent 只能在列出的目录下干活) */
+    workspaceRoots?: string[];
 }
 /**
  * 插件入口: 启动 MCP server(StreamableHTTP, 跨网), 通过 ctx 桥接 Harness 能力。

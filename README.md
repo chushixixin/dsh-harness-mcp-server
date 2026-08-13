@@ -98,7 +98,12 @@ printf 'n\nY\n' | hermes mcp add harness_plugin --url http://127.0.0.1:8090/mcp
 - insert:
     - id: harness-mcp-server
       name: '@chushixixin/dsh-harness-mcp-server'
-      config: { http: true, port: 8090, host: 0.0.0.0 }
+      config:
+        http: true
+        port: 8090
+        host: 127.0.0.1        # 默认仅本机; 暴露前必须加认证
+        # authToken: 'your-secret-token'     # 可选: Bearer token 认证
+        # workspaceRoots: ['/workspace']      # 可选: cwd 白名单
 ```
 
 ## Positioning

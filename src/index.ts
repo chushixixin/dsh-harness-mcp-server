@@ -51,6 +51,10 @@ export interface Config {
   taskTtlMs?: number
   /** 常驻 agent 会话上限(默认 8, LRU 淘汰) */
   maxAgents?: number
+  /** Bearer token 认证(设置后所有请求必须带 Authorization: Bearer <token>) */
+  authToken?: string
+  /** cwd 白名单(设置后 agent 只能在列出的目录下干活) */
+  workspaceRoots?: string[]
 }
 
 /** 运行时配置(apply 时从 config 初始化, 提供安全默认值) */
@@ -61,6 +65,8 @@ const runtimeConfig = {
   maxQueue: 100,
   taskTtlMs: 10 * 60 * 1000,
   maxAgents: 8,
+  authToken: '',
+  workspaceRoots: [] as string[],
 }
 
 /** 工具回调统一返回 MCP text content */
@@ -169,6 +175,16 @@ function truncateResult(result: TaskResult): TaskResult {
 async function executeTask(ctx: Context, task: string, context: string, cwd: string): Promise<TaskResult> {
   // 规范化 cwd, 避免 /a、/a/.、相对路径、符号链接成为不同 Map key 导致重复创建会话/并发冲突
   const workdir = cwd ? resolve(cwd) : process.cwd()
+  // cwd 白名单: 配置了 workspaceRoots 时, 只允许在列出的目录下干活(防路径穿越)
+  if (runtimeConfig.workspaceRoots.length > 0) {
+    const allowed = runtimeConfig.workspaceRoots.some((root) => {
+      const r = resolve(root)
+      return workdir === r || workdir.startsWith(r + '/')
+    })
+    if (!allowed) {
+      throw new Error(`cwd not allowed (outside workspaceRoots): ${workdir}`)
+    }
+  }
   return withLock(workdir, async () => {
     const { sessionId, handle } = await getAgent(ctx, workdir)
     const baseline = ((handle.agent.session as unknown as { log?: unknown[] }).log ?? []).length
@@ -355,6 +371,8 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   if (config.maxQueue !== undefined) runtimeConfig.maxQueue = config.maxQueue
   if (config.taskTtlMs !== undefined) runtimeConfig.taskTtlMs = config.taskTtlMs
   if (config.maxAgents !== undefined) runtimeConfig.maxAgents = config.maxAgents
+  if (config.authToken) runtimeConfig.authToken = config.authToken
+  if (config.workspaceRoots) runtimeConfig.workspaceRoots = config.workspaceRoots
 
   const port = config.port ?? 8090
   // 安全默认: 仅监听本机。暴露公网/局域网前必须自行加认证+反代+TLS(见 README 警告)
@@ -365,6 +383,15 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   const transports = new Map<string, StreamableHTTPServerTransport>()
 
   const server = http.createServer(async (req, res) => {
+    // Bearer token 认证(配置了 authToken 时强制所有请求校验)
+    if (runtimeConfig.authToken) {
+      const auth = req.headers['authorization']
+      if (auth !== `Bearer ${runtimeConfig.authToken}`) {
+        res.writeHead(401, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized' }, id: null }))
+        return
+      }
+    }
     const sessionId = (req.headers['mcp-session-id'] as string | undefined) ?? undefined
     const existing = sessionId ? transports.get(sessionId) : undefined
 
@@ -381,7 +408,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
 
     // 新 session 初始化(仅 POST 且无 session id)
     if (req.method === 'POST' && !sessionId) {
-      const mcp = new McpServer({ name: 'harness', version: '0.1.3' })
+      const mcp = new McpServer({ name: 'harness', version: '0.1.4' })
       registerTools(mcp, ctx)
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
