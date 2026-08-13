@@ -289,7 +289,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
         await transports.get(sessionId)!.handleRequest(req as never, res as never)
         return
       }
-      const mcp = new McpServer({ name: 'harness', version: '0.1.0' })
+      const mcp = new McpServer({ name: 'harness', version: '0.1.1' })
       registerTools(mcp, ctx)
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
