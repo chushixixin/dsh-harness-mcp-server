@@ -20,6 +20,18 @@ export interface Config {
     http?: boolean;
     port?: number;
     host?: string;
+    /** 后端 provider(默认 deepseek-official) */
+    provider?: string;
+    /** 执行任务的模型(默认 deepseek-v4-flash) */
+    model?: string;
+    /** 挂载的 agent preset(默认 standard) */
+    preset?: string;
+    /** 任务队列容量上限(默认 100) */
+    maxQueue?: number;
+    /** 已完成任务保留毫秒数(默认 10 分钟) */
+    taskTtlMs?: number;
+    /** 常驻 agent 会话上限(默认 8, LRU 淘汰) */
+    maxAgents?: number;
 }
 /**
  * 插件入口: 启动 MCP server(StreamableHTTP, 跨网), 通过 ctx 桥接 Harness 能力。

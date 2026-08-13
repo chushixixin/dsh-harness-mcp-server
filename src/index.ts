@@ -26,6 +26,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { randomUUID } from 'node:crypto'
 import http from 'node:http'
+import { resolve } from 'node:path'
 
 /** Cordis 插件名 */
 export const name = 'harness-mcp-server'
@@ -38,6 +39,28 @@ export interface Config {
   http?: boolean
   port?: number
   host?: string
+  /** 后端 provider(默认 deepseek-official) */
+  provider?: string
+  /** 执行任务的模型(默认 deepseek-v4-flash) */
+  model?: string
+  /** 挂载的 agent preset(默认 standard) */
+  preset?: string
+  /** 任务队列容量上限(默认 100) */
+  maxQueue?: number
+  /** 已完成任务保留毫秒数(默认 10 分钟) */
+  taskTtlMs?: number
+  /** 常驻 agent 会话上限(默认 8, LRU 淘汰) */
+  maxAgents?: number
+}
+
+/** 运行时配置(apply 时从 config 初始化, 提供安全默认值) */
+const runtimeConfig = {
+  provider: 'deepseek-official',
+  model: 'deepseek-v4-flash',
+  preset: 'standard',
+  maxQueue: 100,
+  taskTtlMs: 10 * 60 * 1000,
+  maxAgents: 8,
 }
 
 /** 工具回调统一返回 MCP text content */
@@ -54,15 +77,28 @@ const agentLocks = new Map<string, Promise<unknown>>()
 /** 获取(或创建)指定 cwd 的常驻 agent 会话 */
 async function getAgent(ctx: Context, cwd: string): Promise<{ sessionId: SessionId; handle: AgentHandle }> {
   const existing = liveAgents.get(cwd)
-  if (existing) return existing
+  if (existing) {
+    // LRU: 命中则移到末尾(最近使用)
+    liveAgents.delete(cwd)
+    liveAgents.set(cwd, existing)
+    return existing
+  }
+  // LRU 淘汰: 超过上限时逐出最久未用的会话
+  while (liveAgents.size >= runtimeConfig.maxAgents) {
+    const oldestKey = liveAgents.keys().next().value as string | undefined
+    if (oldestKey === undefined) break
+    const old = liveAgents.get(oldestKey)
+    liveAgents.delete(oldestKey)
+    try { (old?.handle as { dispose?: () => void } | undefined)?.dispose?.() } catch { /* 忽略 */ }
+  }
   const sessionId = SessionId(randomUUID())
   const handle = await ctx.agents.create({
     sessionId,
     meta: { cwd },
-    agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
+    agentOptions: { provider: runtimeConfig.provider, model: runtimeConfig.model },
     setup: async (agentCtx) => {
-      // 关键: 通过 setup 挂载 standard preset(含 bash/fs/todo/web 等完整工具)
-      await ctx.agentPresets.mount(agentCtx, 'standard')
+      // 关键: 通过 setup 挂载 preset(含 bash/fs/todo/web 等完整工具)
+      await ctx.agentPresets.mount(agentCtx, runtimeConfig.preset)
     },
   })
   const rec = { sessionId, handle }
@@ -90,23 +126,33 @@ interface TaskResult {
   leftovers: string
 }
 
-/** 从 agent 最终回答里宽松解析 changes/verification/leftovers */
+/** 从 agent 最终回答里解析 changes/verification/leftovers(从后往前找候选, 更可靠) */
 function parseSummary(assistantText: string): { changes: string; verification: string; leftovers: string } {
   const empty = { changes: '', verification: '', leftovers: '' }
-  // 找第一个 {...} JSON 块(agent 被要求输出 summary JSON)
-  const m = assistantText.match(/\{[\s\S]*?\}/)
-  if (!m) return empty
-  try {
-    const obj = JSON.parse(m[0]) as Record<string, unknown>
-    const s = (v: unknown) => (typeof v === 'string' ? v : '')
-    return {
-      changes: s(obj.changes) || s(obj.改动) || '',
-      verification: s(obj.verification) || s(obj.验证) || '',
-      leftovers: s(obj.leftovers) || s(obj.遗留) || s(obj.leftover) || '',
-    }
-  } catch {
-    return empty
+  // 收集所有 {...} 候选(agent 被要求输出一行 summary JSON)
+  const candidates: string[] = []
+  const re = /\{[\s\S]*?\}/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(assistantText)) !== null) {
+    candidates.push(m[0])
   }
+  // 从后往前: 最后出现的候选最可能是最终 summary, 逐个尝试解析
+  for (let i = candidates.length - 1; i >= 0; i--) {
+    try {
+      const obj = JSON.parse(candidates[i] as string) as Record<string, unknown>
+      const s = (v: unknown) => (typeof v === 'string' ? v : '')
+      const changes = s(obj.changes) || s(obj.改动)
+      const verification = s(obj.verification) || s(obj.验证)
+      const leftovers = s(obj.leftovers) || s(obj.遗留) || s(obj.leftover)
+      // 只要含任一 summary 字段就采纳, 否则继续尝试更早的候选
+      if (changes || verification || leftovers) {
+        return { changes, verification, leftovers }
+      }
+    } catch {
+      // 非合法 JSON, 继续尝试下一个候选
+    }
+  }
+  return empty
 }
 
 /** 分字段限长, 保证返回的永远是完整合法 JSON(避免 slice(-16000) 截断开头导致非法 JSON) */
@@ -121,7 +167,8 @@ function truncateResult(result: TaskResult): TaskResult {
 
 /** 核心执行: 组装任务(注入记忆上下文+结构化要求) → agent 执行 → 读结构化结果 */
 async function executeTask(ctx: Context, task: string, context: string, cwd: string): Promise<TaskResult> {
-  const workdir = cwd || process.cwd()
+  // 规范化 cwd, 避免 /a、/a/.、相对路径、符号链接成为不同 Map key 导致重复创建会话/并发冲突
+  const workdir = cwd ? resolve(cwd) : process.cwd()
   return withLock(workdir, async () => {
     const { sessionId, handle } = await getAgent(ctx, workdir)
     const baseline = ((handle.agent.session as unknown as { log?: unknown[] }).log ?? []).length
@@ -202,6 +249,8 @@ interface TaskItem {
   status: 'queued' | 'running' | 'done' | 'error'
   result?: TaskResult
   error?: string
+  createdAt: number
+  finishedAt?: number
 }
 const taskQueue = new Map<string, TaskItem>()
 
@@ -242,9 +291,22 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       cwd: z.string().optional().describe('工作目录'),
     },
     async ({ task, context, cwd }) => {
+      const now = Date.now()
+      // TTL 清理: 删除已完成/失败且超时的任务
+      for (const [tid, t] of taskQueue) {
+        if ((t.status === 'done' || t.status === 'error') && t.finishedAt && now - t.finishedAt > runtimeConfig.taskTtlMs) {
+          taskQueue.delete(tid)
+        }
+      }
+      // 队列容量上限: 活动任务(排队+执行中)超过上限则拒绝
+      let active = 0
+      for (const t of taskQueue.values()) if (t.status === 'queued' || t.status === 'running') active++
+      if (active >= runtimeConfig.maxQueue) {
+        return out(JSON.stringify({ error: `task queue full (${active}/${runtimeConfig.maxQueue})` }))
+      }
       const id = randomUUID()
       const item: TaskItem = {
-        id, task, context: context ?? '', cwd: cwd ?? process.cwd(), status: 'queued',
+        id, task, context: context ?? '', cwd: cwd ?? process.cwd(), status: 'queued', createdAt: now,
       }
       taskQueue.set(id, item)
       // 异步执行(不阻塞 Hermes)
@@ -258,6 +320,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           item.error = String(e)
           item.status = 'error'
         }
+        item.finishedAt = Date.now()
       })()
       return out(JSON.stringify({ taskId: id, status: 'queued' }))
     },
@@ -285,6 +348,14 @@ function registerTools(mcp: McpServer, ctx: Context): void {
  * 插件入口: 启动 MCP server(StreamableHTTP, 跨网), 通过 ctx 桥接 Harness 能力。
  */
 export async function apply(ctx: Context, config: Config = {}): Promise<void> {
+  // 初始化运行时配置(覆盖默认值)
+  if (config.provider) runtimeConfig.provider = config.provider
+  if (config.model) runtimeConfig.model = config.model
+  if (config.preset) runtimeConfig.preset = config.preset
+  if (config.maxQueue !== undefined) runtimeConfig.maxQueue = config.maxQueue
+  if (config.taskTtlMs !== undefined) runtimeConfig.taskTtlMs = config.taskTtlMs
+  if (config.maxAgents !== undefined) runtimeConfig.maxAgents = config.maxAgents
+
   const port = config.port ?? 8090
   // 安全默认: 仅监听本机。暴露公网/局域网前必须自行加认证+反代+TLS(见 README 警告)
   const host = config.host ?? '127.0.0.1'
@@ -294,13 +365,23 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   const transports = new Map<string, StreamableHTTPServerTransport>()
 
   const server = http.createServer(async (req, res) => {
-    if (req.method === 'POST') {
-      const sessionId = (req.headers['mcp-session-id'] as string | undefined) ?? undefined
-      if (sessionId && transports.has(sessionId)) {
-        await transports.get(sessionId)!.handleRequest(req as never, res as never)
+    const sessionId = (req.headers['mcp-session-id'] as string | undefined) ?? undefined
+    const existing = sessionId ? transports.get(sessionId) : undefined
+
+    // 已有 session: GET/POST/DELETE 都路由到对应 transport(支持 SSE 流 + 会话终止)
+    if (existing) {
+      if (req.method === 'GET' || req.method === 'POST' || req.method === 'DELETE') {
+        await existing.handleRequest(req as never, res as never)
         return
       }
-      const mcp = new McpServer({ name: 'harness', version: '0.1.2' })
+      res.writeHead(405, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32600, message: 'Method not allowed' }, id: null }))
+      return
+    }
+
+    // 新 session 初始化(仅 POST 且无 session id)
+    if (req.method === 'POST' && !sessionId) {
+      const mcp = new McpServer({ name: 'harness', version: '0.1.3' })
       registerTools(mcp, ctx)
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
@@ -309,13 +390,29 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
           servers.set(sid, mcp)
         },
       })
-      transports.set(transport.sessionId ?? randomUUID(), transport)
+      // 会话关闭时清理映射(避免临时 key 泄漏 + 无效会话累积)
+      transport.onclose = () => {
+        const sid = transport.sessionId
+        if (sid) {
+          transports.delete(sid)
+          servers.delete(sid)
+        }
+      }
       await mcp.connect(transport as never)
       await transport.handleRequest(req as never, res as never)
-    } else {
-      res.writeHead(405, { 'Content-Type': 'text/plain' })
-      res.end('Method Not Allowed: use POST for MCP')
+      return
     }
+
+    // 未知 session → 404(不新建 transport, 避免遗留对象)
+    if (sessionId) {
+      res.writeHead(404, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message: 'Session not found' }, id: null }))
+      return
+    }
+
+    // 无 session 的非初始化请求 → 400
+    res.writeHead(400, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32600, message: 'Invalid request' }, id: null }))
   })
 
   server.listen(port, host, () => {
