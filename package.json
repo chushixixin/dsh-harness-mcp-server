@@ -1,5 +1,5 @@
 {
-  "name": "@deepseek-ai/dsh-harness-mcp-server",
+  "name": "@chushixixin/dsh-harness-mcp-server",
   "version": "0.1.0",
   "description": "Expose DeepSeek Harness agent capabilities as an MCP server, so an external MCP client (e.g. Hermes) can drive Harness to execute coding tasks. Hermes = brain, Harness = arms.",
   "type": "module",
@@ -22,6 +22,14 @@
     "cordis",
     "ai-agent"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chushixixin/dsh-harness-mcp-server.git"
+  },
+  "homepage": "https://github.com/chushixixin/dsh-harness-mcp-server#readme",
+  "bugs": {
+    "url": "https://github.com/chushixixin/dsh-harness-mcp-server/issues"
+  },
   "license": "MIT",
   "dependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
