@@ -408,7 +408,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
 
     // 新 session 初始化(仅 POST 且无 session id)
     if (req.method === 'POST' && !sessionId) {
-      const mcp = new McpServer({ name: 'harness', version: '0.1.4' })
+      const mcp = new McpServer({ name: 'harness', version: '0.1.5' })
       registerTools(mcp, ctx)
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
@@ -450,8 +450,8 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   })
 
   // 标准 cordis 生命周期: 用 ctx.effect 注册清理(卸载时关 server + 清空全部映射/会话/队列)
-  ctx.effect(function* () {
-    yield () => {
+  ctx.effect(() => {
+    return () => {
       server.close()
       transports.clear()
       servers.clear()
