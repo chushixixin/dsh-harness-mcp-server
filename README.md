@@ -82,7 +82,9 @@ export DEEPSEEK_API_KEY=...
 corepack pnpm dsh web --patch ./packages/mcp/harness-mcp-server/cordis.yml
 ```
 
-The MCP server listens on `0.0.0.0:8090` (StreamableHTTP). Point any MCP client at `http://127.0.0.1:8090/mcp`.
+The MCP server listens on `127.0.0.1:8090` (StreamableHTTP). Point any MCP client at `http://127.0.0.1:8090/mcp`.
+
+> ⚠️ **Security**: by default the server binds to `127.0.0.1` only. It exposes **unauthenticated remote code execution** — do **not** bind it to `0.0.0.0` or expose it to the internet/LAN without adding authentication, TLS, and a reverse proxy first.
 
 ### Hermes client config
 

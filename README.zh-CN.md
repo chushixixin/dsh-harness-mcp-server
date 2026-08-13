@@ -84,7 +84,9 @@ export DEEPSEEK_API_KEY=...
 corepack pnpm dsh web --patch ./packages/mcp/harness-mcp-server/cordis.yml
 ```
 
-MCP server 监听 `0.0.0.0:8090`（StreamableHTTP）。任意 MCP 客户端指向 `http://127.0.0.1:8090/mcp` 即可。
+MCP server 监听 `127.0.0.1:8090`（StreamableHTTP）。任意 MCP 客户端指向 `http://127.0.0.1:8090/mcp` 即可。
+
+> ⚠️ **安全警告**：默认只监听 `127.0.0.1`（本机）。它暴露的是**未鉴权的远程代码执行**能力——在没有加认证、TLS 和反向代理之前，**不要**绑定 `0.0.0.0` 或暴露到公网/局域网。
 
 ### Hermes 客户端配置
 

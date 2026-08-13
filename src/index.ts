@@ -109,6 +109,16 @@ function parseSummary(assistantText: string): { changes: string; verification: s
   }
 }
 
+/** 分字段限长, 保证返回的永远是完整合法 JSON(避免 slice(-16000) 截断开头导致非法 JSON) */
+function truncateResult(result: TaskResult): TaskResult {
+  return {
+    ...result,
+    assistantText: result.assistantText.slice(0, 8000),
+    toolCalls: result.toolCalls.slice(0, 50).map((c) => ({ ...c, args: c.args.slice(0, 2000) })),
+    toolResults: result.toolResults.slice(0, 20).map((r) => r.slice(0, 2000)),
+  }
+}
+
 /** 核心执行: 组装任务(注入记忆上下文+结构化要求) → agent 执行 → 读结构化结果 */
 async function executeTask(ctx: Context, task: string, context: string, cwd: string): Promise<TaskResult> {
   const workdir = cwd || process.cwd()
@@ -125,7 +135,7 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
     ].filter(Boolean).join('\n')
 
     handle.agent.followup(
-      createUserMessage({ content: [{ type: 'text', text: fullTask }], source: { kind: 'user' } }),
+      createUserMessage({ content: [{ type: 'text', text: fullTask }], source: { kind: 'plugin', plugin: 'harness-mcp-server' } }),
     )
     await handle.agent.whenIdle()
 
@@ -218,7 +228,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     },
     async ({ task, context, cwd }) => {
       const result = await executeTask(ctx, task, context ?? '', cwd ?? process.cwd())
-      return out(JSON.stringify(result, null, 2).slice(-16000))
+      return out(JSON.stringify(truncateResult(result), null, 2))
     },
   )
 
@@ -265,8 +275,8 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         taskId: item.id,
         status: item.status,
         error: item.error,
-        result: item.result,
-      }, null, 2).slice(-16000))
+        result: item.result ? truncateResult(item.result) : undefined,
+      }, null, 2))
     },
   )
 }
@@ -276,7 +286,8 @@ function registerTools(mcp: McpServer, ctx: Context): void {
  */
 export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   const port = config.port ?? 8090
-  const host = config.host ?? '0.0.0.0'
+  // 安全默认: 仅监听本机。暴露公网/局域网前必须自行加认证+反代+TLS(见 README 警告)
+  const host = config.host ?? '127.0.0.1'
   console.log('[harness-mcp-server] apply called, port=', port)
 
   const servers = new Map<string, McpServer>()
@@ -289,7 +300,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
         await transports.get(sessionId)!.handleRequest(req as never, res as never)
         return
       }
-      const mcp = new McpServer({ name: 'harness', version: '0.1.1' })
+      const mcp = new McpServer({ name: 'harness', version: '0.1.2' })
       registerTools(mcp, ctx)
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
@@ -314,11 +325,15 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     console.error('[harness-mcp-server] HTTP server error:', e.message)
   })
 
-  try {
-    ;(ctx as unknown as { onDispose?: (fn: () => void) => void }).onDispose?.(() => {
+  // 标准 cordis 生命周期: 用 ctx.effect 注册清理(卸载时关 server + 清空全部映射/会话/队列)
+  ctx.effect(function* () {
+    yield () => {
       server.close()
-    })
-  } catch {
-    // 忽略清理错误, 不阻断插件启动
-  }
+      transports.clear()
+      servers.clear()
+      liveAgents.clear()
+      agentLocks.clear()
+      taskQueue.clear()
+    }
+  }, 'harness-mcp-server')
 }
