@@ -145,6 +145,22 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string): Promise<
   const rec = { sessionId: newSessionId, handle }
   liveAgents.set(cwd, rec)
   sessionToCwd.set(String(newSessionId), cwd)
+
+  // 诉求3: 把会话归属到 cwd 对应的工作区分组(可选依赖; headless/无 workspaceRegistry 的环境自动跳过)
+  void (async () => {
+    try {
+      const registry = ctx.get('workspaceRegistry') as
+        | { create?: (path: string) => Promise<{ attachSession?: (sid: SessionId) => Promise<void> }> }
+        | undefined
+      if (registry?.create) {
+        const workspace = await registry.create(cwd)
+        await workspace.attachSession?.(newSessionId)
+      }
+    } catch (e) {
+      console.warn('[harness-mcp-server] workspace attach failed:', String(e))
+    }
+  })()
+
   return rec
 }
 
@@ -448,7 +464,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
 
     // 新 session 初始化(仅 POST 且无 session id)
     if (req.method === 'POST' && !sessionId) {
-      const mcp = new McpServer({ name: 'harness', version: '0.1.7' })
+      const mcp = new McpServer({ name: 'harness', version: '0.1.8' })
       registerTools(mcp, ctx)
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),

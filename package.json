@@ -1,6 +1,6 @@
 {
   "name": "@chushixixin/dsh-harness-mcp-server",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Expose DeepSeek Harness agent capabilities as an MCP server, so an external MCP client (e.g. Hermes) can drive Harness to execute coding tasks. Hermes = brain, Harness = arms.",
   "type": "module",
   "main": "lib/index.js",
