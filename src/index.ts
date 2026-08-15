@@ -85,8 +85,8 @@ const sessionToCwd = new Map<string, string>()
 /** 每个 cwd 的串行执行锁(防同一 agent 会话被并发 followup 冲突) */
 const agentLocks = new Map<string, Promise<unknown>>()
 
-/** 获取(或创建)指定 cwd 的常驻 agent 会话; 传 sessionId 时续接指定会话 */
-async function getAgent(ctx: Context, cwd: string, sessionId?: string): Promise<{ sessionId: SessionId; handle: AgentHandle }> {
+/** 获取(或创建)指定 cwd 的常驻 agent 会话; 传 sessionId 时续接指定会话; 传 title 时给新会话命名 */
+async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: string): Promise<{ sessionId: SessionId; handle: AgentHandle }> {
   // 指定 sessionId: 续接已有会话(长任务分多轮投喂 / 中断后恢复)
   if (sessionId) {
     const targetCwd = sessionToCwd.get(sessionId)
@@ -161,6 +161,17 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string): Promise<
     }
   })()
 
+  // title 命名(可选): 创建会话后立即命名(走 sessionTitle 服务的 rename)
+  if (title) {
+    try {
+      const session = handle.agent.session as { id?: unknown }
+      const st = ctx.get('sessionTitle') as { rename?: (s: unknown, t: string) => unknown } | undefined
+      st?.rename?.(session, title)
+    } catch (e) {
+      console.warn('[harness-mcp-server] session title set failed:', String(e))
+    }
+  }
+
   return rec
 }
 
@@ -224,7 +235,7 @@ function truncateResult(result: TaskResult): TaskResult {
 }
 
 /** 核心执行: 组装任务(注入记忆上下文+结构化要求) → agent 执行 → 读结构化结果 */
-async function executeTask(ctx: Context, task: string, context: string, cwd: string, resumeSessionId?: string): Promise<TaskResult> {
+async function executeTask(ctx: Context, task: string, context: string, cwd: string, resumeSessionId?: string, title?: string): Promise<TaskResult> {
   // 规范化 cwd, 避免 /a、/a/.、相对路径、符号链接成为不同 Map key 导致重复创建会话/并发冲突
   const workdir = cwd ? resolve(cwd) : process.cwd()
   // cwd 白名单: 配置了 workspaceRoots 时, 只允许在列出的目录下干活(防路径穿越)
@@ -238,7 +249,7 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
     }
   }
   return withLock(workdir, async () => {
-    const { sessionId, handle } = await getAgent(ctx, workdir, resumeSessionId)
+    const { sessionId, handle } = await getAgent(ctx, workdir, resumeSessionId, title)
     const baseline = ((handle.agent.session as unknown as { log?: unknown[] }).log ?? []).length
 
     // 组装完整任务文本: 记忆上下文 + 任务 + 结构化输出要求
@@ -315,6 +326,7 @@ interface TaskItem {
   context: string
   cwd: string
   sessionId?: string
+  title?: string
   status: 'queued' | 'running' | 'done' | 'error'
   result?: TaskResult
   error?: string
@@ -344,9 +356,10 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       context: z.string().optional().describe('Hermes 记忆/上下文, 注入给 agent 参考'),
       cwd: z.string().optional().describe('工作目录(默认当前)'),
       sessionId: z.string().optional().describe('续接已有会话的 sessionId(来自上次 agent_run 结果里的 sessionId 字段)'),
+      title: z.string().optional().describe('新会话的标题(创建时命名, 便于会话列表归档)'),
     },
-    async ({ task, context, cwd, sessionId }) => {
-      const result = await executeTask(ctx, task, context ?? '', cwd ?? process.cwd(), sessionId)
+    async ({ task, context, cwd, sessionId, title }) => {
+      const result = await executeTask(ctx, task, context ?? '', cwd ?? process.cwd(), sessionId, title)
       return out(JSON.stringify(truncateResult(result), null, 2))
     },
   )
@@ -360,8 +373,9 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       context: z.string().optional().describe('Hermes 记忆/上下文, 随任务注入给 agent'),
       cwd: z.string().optional().describe('工作目录'),
       sessionId: z.string().optional().describe('续接已有会话的 sessionId(来自上次 agent_run 结果)'),
+      title: z.string().optional().describe('新会话的标题(创建时命名)'),
     },
-    async ({ task, context, cwd, sessionId }) => {
+    async ({ task, context, cwd, sessionId, title }) => {
       const now = Date.now()
       // TTL 清理: 删除已完成/失败且超时的任务
       for (const [tid, t] of taskQueue) {
@@ -379,13 +393,14 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       const item: TaskItem = {
         id, task, context: context ?? '', cwd: cwd ?? process.cwd(), status: 'queued', createdAt: now,
         ...(sessionId ? { sessionId } : {}),
+        ...(title ? { title } : {}),
       }
       taskQueue.set(id, item)
       // 异步执行(不阻塞 Hermes)
       void (async () => {
         item.status = 'running'
         try {
-          item.result = await executeTask(ctx, item.task, item.context, item.cwd, item.sessionId)
+          item.result = await executeTask(ctx, item.task, item.context, item.cwd, item.sessionId, item.title)
           item.result.taskId = id
           item.status = 'done'
         } catch (e) {
@@ -412,6 +427,29 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         error: item.error,
         result: item.result ? truncateResult(item.result) : undefined,
       }, null, 2))
+    },
+  )
+
+  // 给已有会话改名(走 sessionTitle 服务, 便于会话列表归档)
+  mcp.tool(
+    'rename_session',
+    '给已有会话改名(走 sessionTitle 服务的 rename), 便于会话列表归档区分。',
+    {
+      sessionId: z.string().describe('要改名的会话 id(来自 agent_run 结果里的 sessionId 字段)'),
+      title: z.string().describe('新标题'),
+    },
+    async ({ sessionId, title }) => {
+      try {
+        const sessions = ctx.get('sessions') as { get?: (id: string) => unknown } | undefined
+        const session = sessions?.get?.(sessionId)
+        if (!session) return out(JSON.stringify({ error: `session not found: ${sessionId}` }))
+        const st = ctx.get('sessionTitle') as { rename?: (s: unknown, t: string) => unknown } | undefined
+        if (!st?.rename) return out(JSON.stringify({ error: 'sessionTitle service unavailable' }))
+        const snapshot = st.rename(session, title) as { title?: string } | undefined
+        return out(JSON.stringify({ ok: true, sessionId, title: snapshot?.title ?? title }))
+      } catch (e) {
+        return out(JSON.stringify({ error: String(e) }))
+      }
     },
   )
 }
@@ -464,7 +502,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
 
     // 新 session 初始化(仅 POST 且无 session id)
     if (req.method === 'POST' && !sessionId) {
-      const mcp = new McpServer({ name: 'harness', version: '0.1.8' })
+      const mcp = new McpServer({ name: 'harness', version: '0.1.9' })
       registerTools(mcp, ctx)
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
