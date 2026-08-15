@@ -52,3 +52,4 @@ export interface Config {
  * 插件入口: 启动 MCP server(StreamableHTTP, 跨网), 通过 ctx 桥接 Harness 能力。
  */
 export declare function apply(ctx: Context, config?: Config): Promise<void>;
+//# sourceMappingURL=index.d.ts.map

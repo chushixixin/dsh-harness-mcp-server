@@ -708,7 +708,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
 
     // 新 session 初始化(仅 POST 且无 session id)
     if (req.method === 'POST' && !sessionId) {
-      const mcp = new McpServer({ name: 'harness', version: '0.1.9' })
+      const mcp = new McpServer({ name: 'harness', version: '0.1.10' })
       registerTools(mcp, ctx)
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
