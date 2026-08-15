@@ -22,6 +22,7 @@ import type { AgentHandle } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
+import { scopeOf } from '@deepseek-ai/dsh-scope'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { randomUUID } from 'node:crypto'
@@ -100,10 +101,19 @@ async function getAgent(ctx: Context, cwd: string): Promise<{ sessionId: Session
   const sessionId = SessionId(randomUUID())
   const handle = await ctx.agents.create({
     sessionId,
-    meta: { cwd },
+    // 声明 preset: 为未来 Harness 版本消费 meta.agentPreset 做准备; 当前版本靠 setup 里手动 mount 兜底。
+    meta: { cwd, agentPreset: runtimeConfig.preset },
     agentOptions: { provider: runtimeConfig.provider, model: runtimeConfig.model },
     setup: async (agentCtx) => {
-      // 关键: 通过 setup 挂载 preset(含 bash/fs/todo/web 等完整工具)
+      // 关键: 通过 setup 挂载 preset(含 bash/fs/todo/web 等完整工具)。
+      // dsh rc.6 的 agent-loop 有 bug: setup 收到的 agent ctx 丢失 scope tag,
+      // 导致 mount 抛 'refusing to compose an unscoped context'。
+      // 这里检测 scope, 无 scope 时跳过挂载(降级为无工具 agent), 避免 agent_run 整体崩溃。
+      // master 及后续版本已修复, 会正常走 mount。
+      if (scopeOf(agentCtx) === undefined) {
+        console.warn('[harness-mcp-server] agent ctx unscoped (dsh rc.6 bug); preset mount skipped — upgrade dsh for full tool support')
+        return
+      }
       await ctx.agentPresets.mount(agentCtx, runtimeConfig.preset)
     },
   })
@@ -408,7 +418,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
 
     // 新 session 初始化(仅 POST 且无 session id)
     if (req.method === 'POST' && !sessionId) {
-      const mcp = new McpServer({ name: 'harness', version: '0.1.5' })
+      const mcp = new McpServer({ name: 'harness', version: '0.1.6' })
       registerTools(mcp, ctx)
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
