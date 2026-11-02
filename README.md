@@ -108,6 +108,12 @@ dsh: startup failed: 1 required plugin did not activate
 
 For the same reason `@deepseek-ai/dsh-scope` must stay **external and never be inlined into the bundle**: scope tags are keyed by `Symbol("dsh.scope")`, and `Symbol("x") !== Symbol("x")`. Inlining creates a second Symbol instance, so `scopeOf(agentCtx)` is always `undefined`, the `standard` preset never mounts, and the agent runs with **no tools at all** (`toolCalls` / `toolResults` permanently empty). 0.1.11 ships `import { scopeOf } from '@deepseek-ai/dsh-scope'` in `lib/index.js`.
 
+## Unattended runs
+
+MCP sessions hide `ask_user_question`, because nobody is there to answer it. To run new sessions under Auto review, install `@deepseek-ai/dsh-experimental-auto-review` in the profile and set `permissionPreset: auto` on the plugin row. The plugin then also sets the approval policy to `never`, so a review denial is final and the task keeps going instead of waiting for a person. The option is empty by default, which keeps the Harness default permissions. Sessions resumed with `sessionId` keep the permissions they already have.
+
+`harness_list_tools` lists the tools a preset really provides, grouped by source. MCP servers with more than 20 tools are collapsed; pass `group` to expand one, or `format: "json"` for structured output.
+
 ## Troubleshooting
 
 ### dsh will not start after installing the plugin — `startup failed: 1 required plugin did not activate`

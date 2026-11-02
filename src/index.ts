@@ -40,7 +40,7 @@ import { z } from 'zod'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionHeader } from '@deepseek-ai/dsh-session'
-import { scopeOf } from '@deepseek-ai/dsh-scope'
+import { createScope, scopeOf } from '@deepseek-ai/dsh-scope'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { randomUUID } from 'node:crypto'
@@ -63,6 +63,8 @@ export interface Config {
   http?: boolean
   port?: number
   host?: string
+  /** 新会话的权限预设(如 auto, 需安装 @deepseek-ai/dsh-experimental-auto-review), 同时把审批设为 never; 留空 = Harness 默认 */
+  permissionPreset?: string
   /** 后端 provider(留空 = 跟随 dsh 的默认模型设置; 显式配置则覆盖) */
   provider?: string
   /** 执行任务的模型(留空 = 跟随 dsh 的默认模型设置; 显式配置则覆盖) */
@@ -92,7 +94,41 @@ const runtimeConfig = {
   taskTtlMs: 10 * 60 * 1000,
   maxAgents: 8,
   authToken: '',
+  permissionPreset: '',
   workspaceRoots: [] as string[],
+}
+
+/** dsh 0.2 把会话日志从 session.log 换成了 snapshotEvents(); 读错就会拿到空结果 */
+function sessionEvents(session: unknown): unknown[] {
+  const s = session as { snapshotEvents?: () => readonly unknown[]; log?: unknown[] }
+  return [...(s.snapshotEvents?.() ?? s.log ?? [])]
+}
+
+/** MCP 任务没有人回答问题, 这个工具只会让任务卡死 */
+function hideInteractiveTools(agentCtx: Context): void {
+  try {
+    (agentCtx.tools as unknown as { restrict(filter: { deny: string[] }): unknown }).restrict({ deny: ['ask_user_question'] })
+  } catch (e) {
+    console.warn('[harness-mcp-server] ask_user_question not hidden:', (e as Error)?.message ?? e)
+  }
+}
+
+/**
+ * 配置了 permissionPreset 时应用到新会话, 并把审批策略设为 never: 调用方是外部客户端,
+ * 没有人等着批准, 否则 Auto review 拒绝后会转人工审批, 任务一直挂起。
+ * 预设不可用(如未安装 Auto review)时保留 Harness 默认值并告警。
+ */
+function applyPermissionPreset(ctx: Context, agent: unknown): void {
+  const name = runtimeConfig.permissionPreset
+  if (!name) return
+  const presets = ctx.get('permissionPresets' as never) as unknown as { set?(session: unknown, name: string): void } | undefined
+  const approval = ctx.get('approval' as never) as unknown as { setPolicy?(agent: unknown, policy: string): void } | undefined
+  try {
+    presets?.set?.((agent as { session: unknown }).session, name)
+    approval?.setPolicy?.(agent, 'never')
+  } catch (e) {
+    console.warn(`[harness-mcp-server] permission preset "${name}" unavailable, keeping default:`, (e as Error)?.message ?? e)
+  }
 }
 
 /** 工具回调统一返回 MCP text content */
@@ -257,6 +293,7 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
             return
           }
           await ctx.agentPresets.mount(agentCtx, runtimeConfig.preset)
+          hideInteractiveTools(agentCtx)
         },
       })
     } catch (e) {
@@ -311,8 +348,10 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
         return
       }
       await ctx.agentPresets.mount(agentCtx, runtimeConfig.preset)
+      hideInteractiveTools(agentCtx)
     },
   })
+  applyPermissionPreset(ctx, handle.agent)
   const rec = { sessionId: newSessionId, handle }
   liveAgents.set(cwd, rec)
   sessionToCwd.set(String(newSessionId), cwd)
@@ -359,6 +398,8 @@ interface TaskResult {
   changes: string
   verification: string
   leftovers: string
+  /** 本轮运行失败的原因(如模型报错) */
+  error?: string
 }
 
 /** 从 agent 最终回答里解析 changes/verification/leftovers(从后往前找候选, 更可靠) */
@@ -419,7 +460,11 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
   const lockKey = resumeSessionId ? `session:${resumeSessionId}` : workdir
   return withLock(lockKey, async () => {
     const { sessionId, handle, disposeAfter } = await getAgent(ctx, workdir, resumeSessionId, title)
-    const baseline = ((handle.agent.session as unknown as { log?: unknown[] }).log ?? []).length
+    const baseline = sessionEvents(handle.agent.session).length
+    let failure: unknown
+    const stopErrors = (ctx as unknown as { on(name: string, fn: (e: { agent: unknown; error: unknown }) => void): () => void }).on('agent/error', ({ agent, error }) => {
+      if (agent === handle.agent) failure = error
+    })
 
     // 组装完整任务文本: 记忆上下文 + 任务 + 结构化输出要求
     const fullTask = [
@@ -435,7 +480,11 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
     handle.agent.followup(
       createUserMessage({ content: [{ type: 'text', text: fullTask }], source: { kind: 'plugin:harness-mcp-server' } }),
     )
-    await handle.agent.whenIdle()
+    try {
+      await handle.agent.whenIdle()
+    } finally {
+      stopErrors()
+    }
 
     // 结构化读输出
     const result: TaskResult = {
@@ -443,7 +492,7 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
       changes: '', verification: '', leftovers: '',
     }
     try {
-      const log = ((handle.agent.session as unknown as { log?: unknown[] }).log ?? []).slice(baseline)
+      const log = sessionEvents(handle.agent.session).slice(baseline)
       const extractText = (obj: unknown, out: string[]): void => {
         if (Array.isArray(obj)) { obj.forEach((x) => extractText(x, out)); return }
         if (obj && typeof obj === 'object') {
@@ -483,6 +532,7 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
     }
 
     // 解析结构化 summary
+    if (failure !== undefined) result.error = (failure as Error)?.message ?? String(failure)
     const summary = parseSummary(result.assistantText)
     result.changes = summary.changes
     result.verification = summary.verification
@@ -574,17 +624,80 @@ async function reattachOrphanSessions(ctx: Context): Promise<{ attached: number;
   return { attached, failed }
 }
 
+interface ListedTool { name: string; description?: unknown }
+
+/** 取预设实际可见的工具: 临时 scope 挂载预设, 读完即释放, 不创建会话 */
+async function presetTools(ctx: Context, preset: string): Promise<{ preset: string; tools: ListedTool[] }> {
+  const key = { name: 'harness-mcp-server.list-tools' }
+  const scope = createScope(ctx, key)
+  try {
+    const { id } = await ctx.agentPresets.mount(scope.ctx, preset)
+    hideInteractiveTools(scope.ctx)
+    const view = (ctx.tools as unknown as { view(scope: unknown): { visible: Map<string, ListedTool> } }).view(key)
+    return { preset: id ?? preset, tools: [...view.visible.values()] }
+  } finally {
+    await scope.dispose()
+  }
+}
+
+/** 描述只留第一句, 列表一屏可读 */
+function briefDescription(text: unknown): string {
+  const line = String(text ?? '').trim().split('\n')[0]!.trim()
+  const sentence = line.match(/^.+?(?:[.!?](?=\s)|[。！？])/)?.[0] ?? line
+  return sentence.length > 100 ? `${sentence.slice(0, 99)}…` : sentence
+}
+
+/** MCP server 工具超过这个数时默认折叠 */
+const COLLAPSE_GROUP_SIZE = 20
+
+/** 按来源分组: 内置工具一组, MCP 工具按 server 分组; 大组折叠, 传 group 展开 */
+function formatToolList(preset: string, tools: ListedTool[], only?: string): string {
+  const groups = new Map<string, ListedTool[]>()
+  for (const tool of [...tools].sort((a, b) => a.name.localeCompare(b.name))) {
+    const group = /^mcp__(.+?)__/.exec(tool.name)?.[1] ?? ''
+    if (!groups.has(group)) groups.set(group, [])
+    groups.get(group)!.push(tool)
+  }
+  const lines = [`预设 ${preset} · 共 ${tools.length} 个工具`]
+  if (only !== undefined && !groups.has(only)) lines.push(`没有分组 ${only}, 可选: ${[...groups.keys()].filter(Boolean).join(', ')}`)
+  for (const group of [...groups.keys()].sort()) {
+    if (only !== undefined && group !== only) continue
+    const members = groups.get(group)!
+    lines.push('', group ? `MCP · ${group} (${members.length})` : `内置 (${members.length})`)
+    if (only === undefined && group && members.length > COLLAPSE_GROUP_SIZE) {
+      lines.push(`已折叠, 传 group="${group}" 查看全部`)
+      continue
+    }
+    for (const tool of members) lines.push(`- ${tool.name}: ${briefDescription(tool.description)}`)
+  }
+  return lines.join('\n')
+}
+
 /** 在给定 McpServer 上注册工具 */
 function registerTools(mcp: McpServer, ctx: Context): void {
   mcp.tool('echo', '回显输入, 验证 MCP server 连通', { text: z.string() }, async ({ text }) => {
     return out(`收到: ${text} @ ${Date.now()}`)
   })
 
-  mcp.tool('harness_list_tools', '列出 Harness 当前注册的所有工具名', {}, async () => {
-    const tools = ctx.tools as unknown as { keys?: () => Iterable<string> } | null
-    const names = tools && typeof tools.keys === 'function' ? Array.from(tools.keys()) : []
-    return out(JSON.stringify(names))
-  })
+  mcp.tool(
+    'harness_list_tools',
+    '列出 agent 在指定预设下可用的工具, 按来源分组并附一句话说明。format=json 返回结构化数据。',
+    {
+      preset: z.string().optional().describe('预设 id(默认: 插件配置的预设)'),
+      format: z.enum(['text', 'json']).optional().describe('输出格式(默认 text)'),
+      group: z.string().optional().describe('只看这个 MCP server 的工具, 并展开折叠的大组'),
+    },
+    async ({ preset, format, group }) => {
+      const listed = await presetTools(ctx, preset ?? runtimeConfig.preset)
+      if (format === 'json') {
+        const tools = listed.tools
+          .map((tool) => ({ name: tool.name, description: briefDescription(tool.description) }))
+          .sort((a, b) => a.name.localeCompare(b.name))
+        return out(JSON.stringify({ preset: listed.preset, tools }, null, 2))
+      }
+      return out(formatToolList(listed.preset, listed.tools, group))
+    },
+  )
 
   // 同步执行任务(简单场景: Hermes 下发 → 立即拿结果)
   mcp.tool(
@@ -599,7 +712,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     },
     async ({ task, context, cwd, sessionId, title }) => {
       const result = await executeTask(ctx, task, context ?? '', cwd ?? process.cwd(), sessionId, title)
-      return out(JSON.stringify(truncateResult(result), null, 2))
+      return { ...out(JSON.stringify(truncateResult(result), null, 2)), ...(result.error ? { isError: true } : {}) }
     },
   )
 
@@ -641,7 +754,8 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         try {
           item.result = await executeTask(ctx, item.task, item.context, item.cwd, item.sessionId, item.title)
           item.result.taskId = id
-          item.status = 'done'
+          item.status = item.result.error ? 'error' : 'done'
+          if (item.result.error) item.error = item.result.error
         } catch (e) {
           item.error = String(e)
           item.status = 'error'
@@ -738,6 +852,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   if (config.taskTtlMs !== undefined) runtimeConfig.taskTtlMs = config.taskTtlMs
   if (config.maxAgents !== undefined) runtimeConfig.maxAgents = config.maxAgents
   if (config.authToken) runtimeConfig.authToken = config.authToken
+  if (config.permissionPreset) runtimeConfig.permissionPreset = config.permissionPreset
   if (config.workspaceRoots) runtimeConfig.workspaceRoots = config.workspaceRoots
 
   const port = config.port ?? 8090

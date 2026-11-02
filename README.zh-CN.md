@@ -110,6 +110,12 @@ dsh: startup failed: 1 required plugin did not activate
 
 同理，`@deepseek-ai/dsh-scope` 还**必须保持 external、绝不能被 bundle 内联**：scope tag 以 `Symbol("dsh.scope")` 为键，`Symbol("x") !== Symbol("x")`，内联会生成第二个 Symbol 实例，导致 `scopeOf(agentCtx)` 恒为 `undefined` —— standard preset 永远挂不上，agent 没有任何工具（`toolCalls` / `toolResults` 恒空）。0.1.11 的 `lib/index.js` 已改为 `import { scopeOf } from '@deepseek-ai/dsh-scope'`。
 
+## 无人值守运行
+
+MCP 会话隐藏 `ask_user_question`，因为没有人回答。要让新会话走 Auto review，在 profile 里安装 `@deepseek-ai/dsh-experimental-auto-review`，并在插件行设置 `permissionPreset: auto`。插件会同时把审批策略设为 `never`，审查拒绝即最终结果，任务不会挂起等人。该选项默认为空，即沿用 Harness 默认权限。用 `sessionId` 续接的会话保留原有权限。
+
+`harness_list_tools` 列出预设实际可用的工具，按来源分组。工具超过 20 个的 MCP server 默认折叠，传 `group` 展开，传 `format: "json"` 取结构化数据。
+
 ## 排障
 
 ### 装完插件后 dsh 起不来，报 `startup failed: 1 required plugin did not activate`
