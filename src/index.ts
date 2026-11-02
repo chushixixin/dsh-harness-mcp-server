@@ -16,6 +16,15 @@
  * 启动时对存量未分组会话补挂一次(存量捞回)。
  *
  * 回路: Hermes 记忆 →(context)→ task_inbox → Harness agent 执行 → 结果进队列 → task_result → Hermes 持久化
+ *
+ * ⚠ 打包铁律(踩过大坑):
+ * 1) 所有 @deepseek-ai/dsh-* 必须声明为 peerDependencies, 绝不能是 dependencies。
+ *    它们是宿主运行时提供的包; 写成 dependencies 会被 pnpm 装进 profile 的 node_modules(hoisted),
+ *    顶替宿主机自己的核心包。DSH 启动前会拿这些包声明的 peer 范围去比对运行时版本, 对不上就
+ *    "disabling profile plugin row llm/session/agent/tools" —— 连锁导致 required 的 agent-loop
+ *    拿不到服务, 直接 "startup failed: 1 required plugin did not activate", DSH 起不来。
+ * 2) @deepseek-ai/dsh-scope 同理, 且必须保持 external: 一旦被 bundle 内联, 就会生成第二个
+ *    Symbol("dsh.scope") 实例, scopeOf 恒为 undefined, preset 挂不上(见 UNSCOPED_WARNING)。
  */
 
 // ── Context 声明合并: 让 ctx.tools / ctx.llm / ctx.agents 有类型 ──
@@ -25,12 +34,13 @@ import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-presets'
 
 import type { Context } from '@deepseek-ai/cordis'
+import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import type { AgentHandle } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionHeader } from '@deepseek-ai/dsh-session'
-import { scopeOf } from '@deepseek-ai/dsh-scope'
+import { createScope, scopeOf } from '@deepseek-ai/dsh-scope'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { randomUUID } from 'node:crypto'
@@ -53,9 +63,11 @@ export interface Config {
   http?: boolean
   port?: number
   host?: string
-  /** 后端 provider(默认 deepseek-official) */
+  /** 新会话的权限预设(如 auto, 需安装 @deepseek-ai/dsh-experimental-auto-review), 同时把审批设为 never; 留空 = Harness 默认 */
+  permissionPreset?: string
+  /** 后端 provider(留空 = 跟随 dsh 的默认模型设置; 显式配置则覆盖) */
   provider?: string
-  /** 执行任务的模型(默认 deepseek-v4-flash) */
+  /** 执行任务的模型(留空 = 跟随 dsh 的默认模型设置; 显式配置则覆盖) */
   model?: string
   /** 挂载的 agent preset(默认 standard) */
   preset?: string
@@ -73,20 +85,104 @@ export interface Config {
 
 /** 运行时配置(apply 时从 config 初始化, 提供安全默认值) */
 const runtimeConfig = {
-  provider: 'deepseek-official',
-  // 空字符串 = 不覆盖 model, 跟随 dsh 的用户/默认设置; 显式配置则覆盖
+  // provider/model 都留空 = 不覆盖, 跟随 dsh 的默认模型服务(ctx.agentDefaultModel);
+  // 显式配置时两者必须同时给全 —— 只给 provider 不给 model 会让 system prompt 的 {{model}} 无值。
+  provider: '',
   model: '',
   preset: 'standard',
   maxQueue: 100,
   taskTtlMs: 10 * 60 * 1000,
   maxAgents: 8,
   authToken: '',
+  permissionPreset: '',
   workspaceRoots: [] as string[],
+}
+
+/** dsh 0.2 把会话日志从 session.log 换成了 snapshotEvents(); 读错就会拿到空结果 */
+function sessionEvents(session: unknown): unknown[] {
+  const s = session as { snapshotEvents?: () => readonly unknown[]; log?: unknown[] }
+  return [...(s.snapshotEvents?.() ?? s.log ?? [])]
+}
+
+/** MCP 任务没有人回答问题, 这个工具只会让任务卡死 */
+function hideInteractiveTools(agentCtx: Context): void {
+  try {
+    (agentCtx.tools as unknown as { restrict(filter: { deny: string[] }): unknown }).restrict({ deny: ['ask_user_question'] })
+  } catch (e) {
+    console.warn('[harness-mcp-server] ask_user_question not hidden:', (e as Error)?.message ?? e)
+  }
+}
+
+/**
+ * 配置了 permissionPreset 时应用到新会话, 并把审批策略设为 never: 调用方是外部客户端,
+ * 没有人等着批准, 否则 Auto review 拒绝后会转人工审批, 任务一直挂起。
+ * 预设不可用(如未安装 Auto review)时保留 Harness 默认值并告警。
+ */
+function applyPermissionPreset(ctx: Context, agent: unknown): void {
+  const name = runtimeConfig.permissionPreset
+  if (!name) return
+  const presets = ctx.get('permissionPresets' as never) as unknown as { set?(session: unknown, name: string): void } | undefined
+  const approval = ctx.get('approval' as never) as unknown as { setPolicy?(agent: unknown, policy: string): void } | undefined
+  try {
+    presets?.set?.((agent as { session: unknown }).session, name)
+    approval?.setPolicy?.(agent, 'never')
+  } catch (e) {
+    console.warn(`[harness-mcp-server] permission preset "${name}" unavailable, keeping default:`, (e as Error)?.message ?? e)
+  }
 }
 
 /** 工具回调统一返回 MCP text content */
 function out(content: string) {
   return { content: [{ type: 'text' as const, text: content }] }
+}
+
+/**
+ * agent ctx 读不到 scope tag 时的告警(create 与 resume 共用)。
+ * 正常情况不该出现: scope tag 用 Symbol("dsh.scope") 做键, 本插件与宿主必须共用同一份
+ * @deepseek-ai/dsh-scope 才有同一个 Symbol 实例。一旦它被打包内联(或宿主与插件解析到
+ * 两份不同副本), scopeOf 恒为 undefined, preset 挂不上, agent 将没有任何工具。
+ */
+const UNSCOPED_WARNING =
+  '[harness-mcp-server] agent ctx carries no scope tag; preset mount skipped. ' +
+  'The plugin and dsh must share ONE @deepseek-ai/dsh-scope instance — keep it a peerDependency and never bundle/inline it.'
+
+/** 模型路由: 与 dsh 的 AgentDefaultModelConfig.currentSelection() 同形(可直接喂给 installModelSelection) */
+interface ModelRoute {
+  provider: string
+  model: string
+  /** 已是 dsh 侧的 branded id, 本插件原样透传 */
+  reasoningEffort?: string
+}
+
+/**
+ * 解析本次 agent 要用的模型路由 —— 与官方 headless-runner 完全同款:
+ *   1) 插件 config 显式给了 provider+model → 用它;
+ *   2) 否则读 dsh 的默认模型服务 ctx.agentDefaultModel.currentSelection()(含 reasoningEffort)。
+ *
+ * 为什么必须解析出一个**具体**路由而不能留空:
+ * dsh 的 system prompt 里 persona 段落引用了 {{model}}/{{provider}} 变量, 而这两个变量由
+ * installModelSelection 注册的 system-prompt/assemble 监听器注入 —— 只有在 selection.current
+ * 有值时才注入。留空会让整轮 assembly 直接抛:
+ *   prompt variable "{{model}}" has no value for this assembly (section "deployment:persona-prefix")
+ * (实战踩过: 老版本硬编码 provider=deepseek-official 且省略 model, 必然触发。)
+ */
+function resolveRoute(ctx: Context, sessionId?: string): ModelRoute {
+  const configured = runtimeConfig.provider !== '' || runtimeConfig.model !== ''
+  if (configured) {
+    if (runtimeConfig.provider === '' || runtimeConfig.model === '') {
+      throw new Error(
+        `harness-mcp-server config needs BOTH provider and model (got provider=${JSON.stringify(runtimeConfig.provider)}, model=${JSON.stringify(runtimeConfig.model)})`,
+      )
+    }
+    return { provider: runtimeConfig.provider, model: runtimeConfig.model }
+  }
+  const svc = ctx.get('agentDefaultModel') as { currentSelection?: () => ModelRoute | undefined } | undefined
+  const fallback = svc?.currentSelection?.()
+  if (fallback !== undefined && fallback.provider !== '' && fallback.model !== '') return fallback
+  throw new Error(
+    `no model route for ${sessionId === undefined ? 'a new agent' : `session ${sessionId}`}: ` +
+      'set provider+model on the harness-mcp-server row, or mount @deepseek-ai/dsh-agent-default-model',
+  )
 }
 
 /** 工作区视图(ctx.get('workspaceRegistry')): 可选依赖, headless/无 workspace 插件的环境自动跳过 */
@@ -179,22 +275,25 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
       return { sessionId: sid, handle: { agent: live, dispose: () => Promise.resolve() }, disposeAfter: false }
     }
     // live 也没有: 从持久化会话存储 resume 并接管(进程重启前的会话、LRU 淘汰后被释放的会话)
+    const route = resolveRoute(ctx, sessionId)
     let handle: AgentHandle
     try {
       handle = await ctx.agents.resume({
         resumeSessionId: sid,
-        agentOptions: {
-          provider: runtimeConfig.provider,
-          // model 为空则省略, 让 dsh 跟随用户/默认设置; 显式配置则覆盖
-          ...(runtimeConfig.model ? { model: runtimeConfig.model } : {}),
-        },
+        // 路由必须给全 provider+model, 否则 {{model}} 变量无值 → 整轮 assembly 失败
+        agentOptions: { provider: route.provider, model: route.model },
         setup: async (agentCtx) => {
-          // 同 create 路径: dsh rc.6 agent ctx 可能丢 scope tag, 检测不到就跳过挂载(降级为无工具 agent)
+          // 先装 model selection: dsh 的 persona 段落靠它注入 {{provider}}/{{model}},
+          // 不装则 assembly 抛 'prompt variable "{{model}}" has no value'
+          installModelSelection(agentCtx, { current: route, assembled: undefined })
+          // 同 create 路径: 必须用宿主那份 @deepseek-ai/dsh-scope 的 scopeOf 才能读到 scope tag
+          // (scope tag 是 Symbol 键, 打包内联会得到另一个 Symbol 实例 → 恒 undefined → preset 挂不上)
           if (scopeOf(agentCtx) === undefined) {
-            console.warn('[harness-mcp-server] agent ctx unscoped (dsh rc.6 bug); preset mount skipped — upgrade dsh for full tool support')
+            console.warn(UNSCOPED_WARNING)
             return
           }
           await ctx.agentPresets.mount(agentCtx, runtimeConfig.preset)
+          hideInteractiveTools(agentCtx)
         },
       })
     } catch (e) {
@@ -228,28 +327,31 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
   // cwd 先 realpath 规范化: session header 的 cwd 与 workspace.path 必须精确相等,
   // 否则 attachSession 强校验 reject(只会 create 注册而 UI 仍落未分组)
   const canonical = await canonicalCwd(cwd)
+  const route = resolveRoute(ctx)
   const handle = await ctx.agents.create({
     sessionId: newSessionId,
     // 声明 preset: 为未来 Harness 版本消费 meta.agentPreset 做准备; 当前版本靠 setup 里手动 mount 兜底。
     meta: { cwd: canonical, agentPreset: runtimeConfig.preset },
-    agentOptions: {
-      provider: runtimeConfig.provider,
-      // model 为空则省略, 让 dsh 跟随用户/默认设置; 显式配置则覆盖
-      ...(runtimeConfig.model ? { model: runtimeConfig.model } : {}),
-    },
+    // 路由必须给全 provider+model, 否则 {{model}} 变量无值 → 整轮 assembly 失败
+    agentOptions: { provider: route.provider, model: route.model },
     setup: async (agentCtx) => {
-      // 关键: 通过 setup 挂载 preset(含 bash/fs/todo/web 等完整工具)。
-      // dsh rc.6 的 agent-loop 有 bug: setup 收到的 agent ctx 丢失 scope tag,
-      // 导致 mount 抛 'refusing to compose an unscoped context'。
-      // 这里检测 scope, 无 scope 时跳过挂载(降级为无工具 agent), 避免 agent_run 整体崩溃。
-      // master 及后续版本已修复, 会正常走 mount。
+      // 1) 先装 model selection: dsh 的 persona 段落靠它的 system-prompt/assemble 监听器
+      //    注入 {{provider}}/{{model}}; 不装则抛 'prompt variable "{{model}}" has no value'。
+      installModelSelection(agentCtx, { current: route, assembled: undefined })
+      // 2) 挂 preset(含 bash/fs/todo/web 等完整工具)。
+      // scope tag 是 Symbol 键: 只有用宿主同一份 @deepseek-ai/dsh-scope 的 scopeOf 才读得到。
+      // 插件曾经把该模块内联进 bundle, 于是拿到另一个 Symbol("dsh.scope") 实例,
+      // scopeOf 恒为 undefined, preset 永远挂不上(agent 无工具, toolCalls 恒空)。
+      // 因此 dsh-scope 必须是 peerDependency 且绝不能被内联 —— 无 scope 时降级为无工具 agent, 不整体崩溃。
       if (scopeOf(agentCtx) === undefined) {
-        console.warn('[harness-mcp-server] agent ctx unscoped (dsh rc.6 bug); preset mount skipped — upgrade dsh for full tool support')
+        console.warn(UNSCOPED_WARNING)
         return
       }
       await ctx.agentPresets.mount(agentCtx, runtimeConfig.preset)
+      hideInteractiveTools(agentCtx)
     },
   })
+  applyPermissionPreset(ctx, handle.agent)
   const rec = { sessionId: newSessionId, handle }
   liveAgents.set(cwd, rec)
   sessionToCwd.set(String(newSessionId), cwd)
@@ -296,6 +398,8 @@ interface TaskResult {
   changes: string
   verification: string
   leftovers: string
+  /** 本轮运行失败的原因(如模型报错) */
+  error?: string
 }
 
 /** 从 agent 最终回答里解析 changes/verification/leftovers(从后往前找候选, 更可靠) */
@@ -356,7 +460,11 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
   const lockKey = resumeSessionId ? `session:${resumeSessionId}` : workdir
   return withLock(lockKey, async () => {
     const { sessionId, handle, disposeAfter } = await getAgent(ctx, workdir, resumeSessionId, title)
-    const baseline = ((handle.agent.session as unknown as { log?: unknown[] }).log ?? []).length
+    const baseline = sessionEvents(handle.agent.session).length
+    let failure: unknown
+    const stopErrors = (ctx as unknown as { on(name: string, fn: (e: { agent: unknown; error: unknown }) => void): () => void }).on('agent/error', ({ agent, error }) => {
+      if (agent === handle.agent) failure = error
+    })
 
     // 组装完整任务文本: 记忆上下文 + 任务 + 结构化输出要求
     const fullTask = [
@@ -366,10 +474,17 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
       `{"changes":"改了什么","verification":"怎么验证的","leftovers":"遗留问题"}`,
     ].filter(Boolean).join('\n')
 
+    // 会话格式 v4 拒绝已废弃的 v3 包装 { kind: 'plugin', plugin: '…' }, 要求"生产者自有"的 kind:
+    // 第三方插件即 `plugin:<name>`(见 dsh 的 producerKind fallback)。用 v3 包装会让整轮运行失败:
+    // "format v4 message requires a producer-owned source kind"
     handle.agent.followup(
-      createUserMessage({ content: [{ type: 'text', text: fullTask }], source: { kind: 'plugin', plugin: 'harness-mcp-server' } }),
+      createUserMessage({ content: [{ type: 'text', text: fullTask }], source: { kind: 'plugin:harness-mcp-server' } }),
     )
-    await handle.agent.whenIdle()
+    try {
+      await handle.agent.whenIdle()
+    } finally {
+      stopErrors()
+    }
 
     // 结构化读输出
     const result: TaskResult = {
@@ -377,7 +492,7 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
       changes: '', verification: '', leftovers: '',
     }
     try {
-      const log = ((handle.agent.session as unknown as { log?: unknown[] }).log ?? []).slice(baseline)
+      const log = sessionEvents(handle.agent.session).slice(baseline)
       const extractText = (obj: unknown, out: string[]): void => {
         if (Array.isArray(obj)) { obj.forEach((x) => extractText(x, out)); return }
         if (obj && typeof obj === 'object') {
@@ -417,6 +532,7 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
     }
 
     // 解析结构化 summary
+    if (failure !== undefined) result.error = (failure as Error)?.message ?? String(failure)
     const summary = parseSummary(result.assistantText)
     result.changes = summary.changes
     result.verification = summary.verification
@@ -508,17 +624,80 @@ async function reattachOrphanSessions(ctx: Context): Promise<{ attached: number;
   return { attached, failed }
 }
 
+interface ListedTool { name: string; description?: unknown }
+
+/** 取预设实际可见的工具: 临时 scope 挂载预设, 读完即释放, 不创建会话 */
+async function presetTools(ctx: Context, preset: string): Promise<{ preset: string; tools: ListedTool[] }> {
+  const key = { name: 'harness-mcp-server.list-tools' }
+  const scope = createScope(ctx, key)
+  try {
+    const { id } = await ctx.agentPresets.mount(scope.ctx, preset)
+    hideInteractiveTools(scope.ctx)
+    const view = (ctx.tools as unknown as { view(scope: unknown): { visible: Map<string, ListedTool> } }).view(key)
+    return { preset: id ?? preset, tools: [...view.visible.values()] }
+  } finally {
+    await scope.dispose()
+  }
+}
+
+/** 描述只留第一句, 列表一屏可读 */
+function briefDescription(text: unknown): string {
+  const line = String(text ?? '').trim().split('\n')[0]!.trim()
+  const sentence = line.match(/^.+?(?:[.!?](?=\s)|[。！？])/)?.[0] ?? line
+  return sentence.length > 100 ? `${sentence.slice(0, 99)}…` : sentence
+}
+
+/** MCP server 工具超过这个数时默认折叠 */
+const COLLAPSE_GROUP_SIZE = 20
+
+/** 按来源分组: 内置工具一组, MCP 工具按 server 分组; 大组折叠, 传 group 展开 */
+function formatToolList(preset: string, tools: ListedTool[], only?: string): string {
+  const groups = new Map<string, ListedTool[]>()
+  for (const tool of [...tools].sort((a, b) => a.name.localeCompare(b.name))) {
+    const group = /^mcp__(.+?)__/.exec(tool.name)?.[1] ?? ''
+    if (!groups.has(group)) groups.set(group, [])
+    groups.get(group)!.push(tool)
+  }
+  const lines = [`预设 ${preset} · 共 ${tools.length} 个工具`]
+  if (only !== undefined && !groups.has(only)) lines.push(`没有分组 ${only}, 可选: ${[...groups.keys()].filter(Boolean).join(', ')}`)
+  for (const group of [...groups.keys()].sort()) {
+    if (only !== undefined && group !== only) continue
+    const members = groups.get(group)!
+    lines.push('', group ? `MCP · ${group} (${members.length})` : `内置 (${members.length})`)
+    if (only === undefined && group && members.length > COLLAPSE_GROUP_SIZE) {
+      lines.push(`已折叠, 传 group="${group}" 查看全部`)
+      continue
+    }
+    for (const tool of members) lines.push(`- ${tool.name}: ${briefDescription(tool.description)}`)
+  }
+  return lines.join('\n')
+}
+
 /** 在给定 McpServer 上注册工具 */
 function registerTools(mcp: McpServer, ctx: Context): void {
   mcp.tool('echo', '回显输入, 验证 MCP server 连通', { text: z.string() }, async ({ text }) => {
     return out(`收到: ${text} @ ${Date.now()}`)
   })
 
-  mcp.tool('harness_list_tools', '列出 Harness 当前注册的所有工具名', {}, async () => {
-    const tools = ctx.tools as unknown as { keys?: () => Iterable<string> } | null
-    const names = tools && typeof tools.keys === 'function' ? Array.from(tools.keys()) : []
-    return out(JSON.stringify(names))
-  })
+  mcp.tool(
+    'harness_list_tools',
+    '列出 agent 在指定预设下可用的工具, 按来源分组并附一句话说明。format=json 返回结构化数据。',
+    {
+      preset: z.string().optional().describe('预设 id(默认: 插件配置的预设)'),
+      format: z.enum(['text', 'json']).optional().describe('输出格式(默认 text)'),
+      group: z.string().optional().describe('只看这个 MCP server 的工具, 并展开折叠的大组'),
+    },
+    async ({ preset, format, group }) => {
+      const listed = await presetTools(ctx, preset ?? runtimeConfig.preset)
+      if (format === 'json') {
+        const tools = listed.tools
+          .map((tool) => ({ name: tool.name, description: briefDescription(tool.description) }))
+          .sort((a, b) => a.name.localeCompare(b.name))
+        return out(JSON.stringify({ preset: listed.preset, tools }, null, 2))
+      }
+      return out(formatToolList(listed.preset, listed.tools, group))
+    },
+  )
 
   // 同步执行任务(简单场景: Hermes 下发 → 立即拿结果)
   mcp.tool(
@@ -533,7 +712,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     },
     async ({ task, context, cwd, sessionId, title }) => {
       const result = await executeTask(ctx, task, context ?? '', cwd ?? process.cwd(), sessionId, title)
-      return out(JSON.stringify(truncateResult(result), null, 2))
+      return { ...out(JSON.stringify(truncateResult(result), null, 2)), ...(result.error ? { isError: true } : {}) }
     },
   )
 
@@ -575,7 +754,8 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         try {
           item.result = await executeTask(ctx, item.task, item.context, item.cwd, item.sessionId, item.title)
           item.result.taskId = id
-          item.status = 'done'
+          item.status = item.result.error ? 'error' : 'done'
+          if (item.result.error) item.error = item.result.error
         } catch (e) {
           item.error = String(e)
           item.status = 'error'
@@ -672,6 +852,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   if (config.taskTtlMs !== undefined) runtimeConfig.taskTtlMs = config.taskTtlMs
   if (config.maxAgents !== undefined) runtimeConfig.maxAgents = config.maxAgents
   if (config.authToken) runtimeConfig.authToken = config.authToken
+  if (config.permissionPreset) runtimeConfig.permissionPreset = config.permissionPreset
   if (config.workspaceRoots) runtimeConfig.workspaceRoots = config.workspaceRoots
 
   const port = config.port ?? 8090
@@ -708,7 +889,7 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
 
     // 新 session 初始化(仅 POST 且无 session id)
     if (req.method === 'POST' && !sessionId) {
-      const mcp = new McpServer({ name: 'harness', version: '0.1.10' })
+      const mcp = new McpServer({ name: 'harness', version: '0.1.13' })
       registerTools(mcp, ctx)
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
